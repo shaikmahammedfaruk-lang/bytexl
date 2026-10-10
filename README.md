@@ -53,6 +53,13 @@ Environment files are local and must not be committed. The checked-in `.env.exam
 
 For production Google sign-in, add the deployed site's exact HTTPS origin (for example `https://brand.example.com`) to the Google OAuth client's authorized JavaScript origins. Do not add URL paths or a trailing slash there. `FRONTEND_URL` controls email links; the Google authorized origin controls where Google will render the sign-in button. Keep SMTP and third-party API secrets server-side, never in frontend `VITE_*` variables.
 
+#### Fix Google `Error 400: origin_mismatch` on Vercel
+
+1. In the Vercel project, set `VITE_GOOGLE_CLIENT_ID` to the same Web application client ID used by the backend's `GOOGLE_CLIENT_ID`, for **Production** and any Preview environments you use.
+2. In Google Cloud Console → Google Auth Platform → Clients → that exact client ID, add each site origin under **Authorized JavaScript origins**, for example `http://localhost:5173` and `https://your-project.vercel.app`. Add a custom domain separately if you use one. Enter only scheme and hostname—no `/login`, path, or trailing slash.
+3. Save the OAuth client, trigger a fresh Vercel deployment so Vite rebuilds with the configured client ID, then open the deployed site at the exact authorized hostname. Preview deployment URLs have their own origins and must be added separately if you sign in from them.
+4. This app uses Google's popup ID-token flow: click **Continue with Google**, choose a Google account if prompted, and the app submits the verified token to the backend and navigates to the dashboard. It does not ask for the account's Google password in this app. Authorized redirect URIs are not used by this popup flow.
+
 ### 3. Backend Setup & Startup
 ```bash
 cd backend

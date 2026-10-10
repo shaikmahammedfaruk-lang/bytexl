@@ -77,6 +77,7 @@ export default function LoginPage() {
 
       window.google.accounts.id.initialize({
         client_id: googleClientId,
+        ux_mode: 'popup',
         callback: async ({ credential }) => {
           if (!credential) {
             setErrorMessage('Google did not return an ID token. Please try again.');
@@ -99,7 +100,7 @@ export default function LoginPage() {
       googleButtonRef.current.replaceChildren();
       window.google.accounts.id.renderButton(googleButtonRef.current, {
         type: 'standard',
-        theme: 'filled_black',
+        theme: 'outline',
         size: 'large',
         text: 'continue_with',
         shape: 'rectangular',
