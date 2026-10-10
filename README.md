@@ -191,3 +191,5 @@ Analysts can instantly test three scenarios with one click in the UI:
 
 ## ⚖️ License
 Built for the **Kampus.VC / ByteXL Hackathon**. All rights reserved.
+#   b y t e x l  
+ 
