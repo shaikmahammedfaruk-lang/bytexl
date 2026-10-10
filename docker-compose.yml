@@ -1,0 +1,100 @@
+# ==============================================================
+# BrandShield AI - Production Docker Compose Orchestration
+# Services:
+#   1. mongodb   - Database persistence with volume
+#   2. backend   - FastAPI REST API & Anti-Impersonation Engine
+#   3. frontend  - React 19 SPA served via Nginx Reverse Proxy
+# ==============================================================
+
+version: '3.8'
+
+services:
+  # ------------------------------------------------------------
+  # 1. MongoDB Database
+  # ------------------------------------------------------------
+  mongodb:
+    image: mongo:7.0
+    container_name: brandshield-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - brandshield-net
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --eval \"db.adminCommand('ping')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ------------------------------------------------------------
+  # 2. FastAPI Backend Service
+  # ------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: brandshield-backend
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017
+      - DB_NAME=brandshield_ai
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in the root .env file}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-10080}
+      - FRONTEND_URL=${FRONTEND_URL:?Set FRONTEND_URL to the public HTTPS URL in the root .env file}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - EMAIL_FROM=${EMAIL_FROM:-security@brandshield.ai}
+      - REQUIRE_EMAIL_VERIFICATION=${REQUIRE_EMAIL_VERIFICATION:-false}
+      - INSTAGRAM_DEMO_MODE=${INSTAGRAM_DEMO_MODE:-true}
+      - PLATFORM_SANDBOX_MODE=${PLATFORM_SANDBOX_MODE:-true}
+    volumes:
+      - backend_static:/app/app/static
+    ports:
+      - "8000:8000"
+    networks:
+      - brandshield-net
+
+  # ------------------------------------------------------------
+  # 3. React Frontend (Nginx Reverse Proxy & Static SPA)
+  # ------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_GOOGLE_CLIENT_ID: ${VITE_GOOGLE_CLIENT_ID:-}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    container_name: brandshield-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    networks:
+      - brandshield-net
+
+# --------------------------------------------------------------
+# Persistent Storage Volumes
+# --------------------------------------------------------------
+volumes:
+  mongo_data:
+    driver: local
+  backend_static:
+    driver: local
+
+# --------------------------------------------------------------
+# Isolated Bridge Network
+# --------------------------------------------------------------
+networks:
+  brandshield-net:
+    driver: bridge
