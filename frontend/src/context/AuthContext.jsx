@@ -28,6 +28,7 @@ export function AuthProvider({ children }) {
   const refreshUser = useCallback(async () => {
     const savedToken = localStorage.getItem('brandshield_token');
     if (!savedToken) {
+      localStorage.removeItem('brandshield_user');
       setUser(null);
       setToken(null);
       setLoading(false);
@@ -36,6 +37,10 @@ export function AuthProvider({ children }) {
 
     try {
       const res = await getCurrentUser();
+      if (localStorage.getItem('brandshield_token') !== savedToken) {
+        return null;
+      }
+
       if (res && res.data) {
         setUser(res.data);
         localStorage.setItem('brandshield_user', JSON.stringify(res.data));
@@ -44,21 +49,51 @@ export function AuthProvider({ children }) {
         throw new Error('Invalid user payload');
       }
     } catch (err) {
+      if (localStorage.getItem('brandshield_token') !== savedToken) {
+        return null;
+      }
+
       console.warn('Session verification failed or expired:', err.message);
+      localStorage.removeItem('brandshield_user');
+      setUser(null);
       if (err.response?.status === 401) {
         localStorage.removeItem('brandshield_token');
-        localStorage.removeItem('brandshield_user');
-        setUser(null);
         setToken(null);
       }
       throw err;
     } finally {
-      setLoading(false);
+      if (localStorage.getItem('brandshield_token') === savedToken) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     refreshUser().catch(() => {});
+  }, [refreshUser]);
+
+  useEffect(() => {
+    const handleStorageChange = (event) => {
+      if (event.key !== 'brandshield_token') {
+        return;
+      }
+
+      const nextToken = localStorage.getItem('brandshield_token');
+      setUser(null);
+      localStorage.removeItem('brandshield_user');
+      setToken(nextToken);
+      setAuthError(null);
+
+      if (nextToken) {
+        setLoading(true);
+        refreshUser().catch(() => {});
+      } else {
+        setLoading(false);
+      }
+    };
+
+    window.addEventListener('storage', handleStorageChange);
+    return () => window.removeEventListener('storage', handleStorageChange);
   }, [refreshUser]);
 
   // Handle standard email/password login
@@ -155,16 +190,16 @@ export function AuthProvider({ children }) {
 
   // Logout
   const logout = async () => {
+    localStorage.removeItem('brandshield_token');
+    localStorage.removeItem('brandshield_user');
+    setUser(null);
+    setToken(null);
+    setAuthError(null);
+
     try {
       await logoutUser();
     } catch (err) {
       console.warn('Logout notification error:', err);
-    } finally {
-      localStorage.removeItem('brandshield_token');
-      localStorage.removeItem('brandshield_user');
-      setUser(null);
-      setToken(null);
-      setAuthError(null);
     }
   };
 

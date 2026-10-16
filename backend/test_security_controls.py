@@ -1,19 +1,29 @@
 import asyncio
 import io
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import jwt
 from bson import ObjectId
 from fastapi import HTTPException, UploadFile
 
+from app.config import settings
 from app.routes.brands import (
     get_readable_brand,
     get_writable_brand,
     upload_brand_logo,
 )
-from app.services.auth_service import is_legacy_default_account
+from app.routes.threats import get_authorized_threat
+from app.services.auth_service import (
+    decode_access_token,
+    is_legacy_default_account,
+    require_current_user,
+    verify_google_id_token,
+)
 from app.routes.access_control import (
     is_brand_child_visible,
+    readable_brand_filter,
     readable_brand_children_filter,
 )
 from app.utils.safe_http import (
@@ -34,10 +44,39 @@ class MemoryBrands:
             None,
         )
 
+    def find(self, query, projection=None):
+        return MemoryCursor([
+            document
+            for document in self.documents
+            if matches(document, query)
+        ])
+
+
+class MemoryCursor:
+    def __init__(self, documents):
+        self.documents = documents
+
+    async def to_list(self, length):
+        return self.documents[:length]
+
+
+class MemoryThreats:
+    def __init__(self, documents):
+        self.documents = documents
+        self.last_query = None
+
+    async def find_one(self, query):
+        self.last_query = query
+        return next(
+            (document for document in self.documents if matches(document, query)),
+            None,
+        )
+
 
 class MemoryDatabase:
-    def __init__(self, documents):
+    def __init__(self, documents, threats=None):
         self.brands = MemoryBrands(documents)
+        self.threats = MemoryThreats(threats or [])
 
 
 def matches(document, query):
@@ -81,6 +120,44 @@ class TestBrandOwnershipControls(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 404)
 
+    async def test_threat_lookup_is_owner_scoped_in_the_mongo_query(self):
+        brand_id = ObjectId()
+        threat_id = ObjectId()
+        db = MemoryDatabase(
+            [{
+                "_id": brand_id,
+                "owner_id": "user-a",
+                "is_demo": False,
+                "is_shared": False,
+            }],
+            [{
+                "_id": threat_id,
+                "brand_id": str(brand_id),
+                "owner_id": "user-a",
+            }],
+        )
+
+        threat = await get_authorized_threat(
+            db,
+            str(threat_id),
+            "user-a",
+        )
+        self.assertEqual(threat["_id"], threat_id)
+        self.assertIn("$and", db.threats.last_query)
+        self.assertFalse(matches(
+            db.threats.documents[0],
+            {
+                "$and": [
+                    {"_id": threat_id},
+                    readable_brand_children_filter([], "user-b"),
+                ]
+            },
+        ))
+
+        with self.assertRaises(HTTPException) as raised:
+            await get_authorized_threat(db, str(threat_id), "user-b")
+        self.assertEqual(raised.exception.status_code, 404)
+
     async def test_ownerless_legacy_brand_is_not_public(self):
         brand_id = ObjectId()
         db = MemoryDatabase([{
@@ -110,6 +187,21 @@ class TestBrandOwnershipControls(unittest.IsolatedAsyncioTestCase):
             await get_writable_brand(db, str(brand_id), "user-a")
 
         self.assertEqual(raised.exception.status_code, 403)
+
+    async def test_user_cannot_update_or_delete_another_users_brand(self):
+        brand_id = ObjectId()
+        db = MemoryDatabase([{
+            "_id": brand_id,
+            "owner_id": "user-a",
+            "is_demo": False,
+            "is_shared": False,
+        }])
+
+        for operation in ("update", "delete"):
+            with self.subTest(operation=operation):
+                with self.assertRaises(HTTPException) as raised:
+                    await get_writable_brand(db, str(brand_id), "user-b")
+                self.assertEqual(raised.exception.status_code, 404)
 
     def test_private_brand_children_are_owner_scoped(self):
         brand_id = ObjectId()
@@ -178,6 +270,195 @@ class TestBrandOwnershipControls(unittest.IsolatedAsyncioTestCase):
             "user-a",
             {"owner_id": None},
         ))
+
+    def test_private_child_queries_exclude_other_users_across_resources(self):
+        brand_id = ObjectId()
+        brand = {
+            "_id": brand_id,
+            "owner_id": "user-a",
+            "is_demo": False,
+            "is_shared": False,
+        }
+        query = readable_brand_children_filter([brand], "user-a")
+
+        for collection in (
+            "threats",
+            "alerts",
+            "campaigns",
+            "investigations",
+            "evidence",
+            "official_assets",
+            "instagram_analyses",
+            "verification_history",
+            "reports",
+        ):
+            with self.subTest(collection=collection):
+                self.assertTrue(matches({
+                    "brand_id": str(brand_id),
+                    "owner_id": "user-a",
+                }, query))
+                self.assertFalse(matches({
+                    "brand_id": str(brand_id),
+                    "owner_id": "user-b",
+                }, query))
+
+    def test_same_brand_name_is_visible_only_to_its_owner_or_as_shared_demo(self):
+        query = readable_brand_filter("user-a")
+        records = [
+            {"owner_id": "user-a", "name": "Example"},
+            {"owner_id": "user-b", "name": "Example"},
+            {
+                "owner_id": None,
+                "is_demo": True,
+                "is_shared": True,
+                "name": "Example",
+            },
+        ]
+
+        visible = [record for record in records if matches(record, query)]
+        self.assertEqual(
+            [record.get("owner_id") for record in visible],
+            ["user-a", None],
+        )
+
+
+class TestAuthenticationValidation(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_current_user_is_unauthorized(self):
+        with self.assertRaises(HTTPException) as raised:
+            await require_current_user(None)
+
+        self.assertEqual(raised.exception.status_code, 401)
+
+    def test_expired_and_subjectless_jwts_are_rejected(self):
+        secret = "isolated-test-secret-not-for-use-outside-tests"
+        now = datetime.now(timezone.utc)
+
+        expired = jwt.encode(
+            {
+                "sub": "user-a",
+                "iat": now - timedelta(hours=2),
+                "exp": now - timedelta(hours=1),
+            },
+            secret,
+            algorithm="HS256",
+        )
+        subjectless = jwt.encode(
+            {
+                "iat": now,
+                "exp": now + timedelta(hours=1),
+            },
+            secret,
+            algorithm="HS256",
+        )
+
+        with patch.object(settings, "JWT_SECRET_KEY", secret):
+            self.assertIsNone(decode_access_token(expired))
+            self.assertIsNone(decode_access_token(subjectless))
+
+    async def test_google_token_audience_is_checked(self):
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def json(self, **kwargs):
+                return {
+                    "aud": "another-client",
+                    "iss": "https://accounts.google.com",
+                    "sub": "google-user",
+                    "email": "user@example.org",
+                    "email_verified": True,
+                }
+
+        class FakeClientSession:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def get(self, *args, **kwargs):
+                return FakeResponse()
+
+        with patch.object(settings, "GOOGLE_CLIENT_ID", "expected-client"):
+            with patch(
+                "app.services.auth_service.aiohttp.ClientSession",
+                FakeClientSession,
+            ):
+                with self.assertRaises(HTTPException) as raised:
+                    await verify_google_id_token("non-empty-test-token")
+
+        self.assertEqual(raised.exception.status_code, 401)
+
+    async def test_google_token_requires_verified_email_and_valid_issuer(self):
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def json(self, **kwargs):
+                return self.payload
+
+        class FakeClientSession:
+            payload = {}
+
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def get(self, *args, **kwargs):
+                return FakeResponse(self.payload)
+
+        with patch.object(settings, "GOOGLE_CLIENT_ID", "expected-client"):
+            with patch(
+                "app.services.auth_service.aiohttp.ClientSession",
+                FakeClientSession,
+            ):
+                for invalid_claims in (
+                    {"iss": "untrusted-issuer", "email_verified": True},
+                    {"iss": "https://accounts.google.com", "email_verified": False},
+                ):
+                    FakeClientSession.payload = {
+                        "aud": "expected-client",
+                        "sub": "google-user",
+                        "email": "user@example.org",
+                        **invalid_claims,
+                    }
+                    with self.subTest(claims=invalid_claims):
+                        with self.assertRaises(HTTPException) as raised:
+                            await verify_google_id_token("non-empty-test-token")
+                        self.assertEqual(raised.exception.status_code, 401)
+
+                FakeClientSession.payload = {
+                    "aud": "expected-client",
+                    "iss": "https://accounts.google.com",
+                    "sub": "google-user",
+                    "email": "user@example.org",
+                    "email_verified": True,
+                }
+                verified = await verify_google_id_token("non-empty-test-token")
+
+        self.assertEqual(verified["sub"], "google-user")
+        self.assertEqual(verified["email"], "user@example.org")
 
 
 class TestPublicLogoUpload(unittest.IsolatedAsyncioTestCase):
