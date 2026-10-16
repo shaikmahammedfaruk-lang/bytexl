@@ -342,15 +342,12 @@
 
 import io
 import base64
-import asyncio
-import ssl
-import urllib.request
-import urllib.error
 import logging
 from typing import Optional, Tuple, Dict, Any
 from urllib.parse import urlparse
-import httpx
 from PIL import Image
+
+from app.utils.safe_http import SafeFetchError, fetch_public_url
 
 logger = logging.getLogger("brandshield.image_sim")
 
@@ -428,20 +425,23 @@ async def fetch_image(url: str, timeout: float = 10.0) -> Tuple[Optional[Image.I
         return None, "Image URL is empty or missing."
     
     clean_url = url.strip()
+    if len(clean_url) > 14 * 1024 * 1024:
+        return None, "Image input is too large."
 
     # Support base64 data URIs
     if clean_url.startswith("data:image/"):
         try:
-            if "," in clean_url:
-                _, b64_part = clean_url.split(",", 1)
-            else:
-                b64_part = clean_url
-            raw_bytes = base64.b64decode(b64_part)
+            if "," not in clean_url:
+                return None, "Invalid image data URI."
+            _, b64_part = clean_url.split(",", 1)
+            raw_bytes = base64.b64decode(b64_part, validate=True)
+            if len(raw_bytes) > 10 * 1024 * 1024:
+                return None, "Image input is too large."
             img = Image.open(io.BytesIO(raw_bytes))
             img.load()
             return img, None
-        except Exception as e:
-            return None, f"Failed to decode base64 image data URI: {str(e)}"
+        except Exception:
+            return None, "Failed to decode image data URI."
 
     if not clean_url.startswith(('http://', 'https://')):
         return None, f"Invalid URL scheme: '{clean_url}'. URL must begin with http:// or https://"
@@ -456,59 +456,28 @@ async def fetch_image(url: str, timeout: float = 10.0) -> Tuple[Optional[Image.I
         "Accept-Language": "en-US,en;q=0.9"
     }
 
-    raw_content = None
-    fetch_err = None
-
-    # Tier 1: Try async httpx client
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers, verify=False) as client:
-            resp = await client.get(clean_url)
-            if resp.status_code == 200:
-                content_type = resp.headers.get("content-type", "").lower()
-                if "text/html" in content_type:
-                    return None, "URL returned HTML webpage content instead of an image file."
-                raw_content = resp.content
-            else:
-                fetch_err = f"HTTP {resp.status_code} ({resp.reason_phrase})"
-    except Exception as e:
-        fetch_err = str(e)
+        response = await fetch_public_url(
+            clean_url,
+            timeout=timeout,
+            headers=headers,
+            max_bytes=10 * 1024 * 1024,
+        )
+    except SafeFetchError as exc:
+        return None, str(exc)
 
-    # Tier 2: Fallback to urllib
-    if raw_content is None:
-        def _urllib_fetch_img(target: str):
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            req = urllib.request.Request(target, headers=headers)
-            try:
-                with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
-                    c_type = r.headers.get("content-type", "").lower()
-                    if "text/html" in c_type:
-                        return None, "URL returned HTML webpage content instead of an image file"
-                    return r.read(), None
-            except urllib.error.HTTPError as he:
-                return None, f"HTTP {he.code} ({he.reason})"
-            except Exception as ex:
-                return None, str(ex)
+    if response.status_code != 200:
+        return None, f"Image request failed with HTTP {response.status_code}."
 
-        try:
-            u_bytes, u_err = await asyncio.to_thread(_urllib_fetch_img, clean_url)
-            if u_bytes:
-                raw_content = u_bytes
-            elif u_err:
-                fetch_err = u_err
-        except Exception as e:
-            fetch_err = str(e)
-
-    if raw_content is None:
-        return None, f"Could not retrieve image from {clean_url}: {fetch_err or 'Connection failed'}"
+    if "text/html" in response.content_type.lower():
+        return None, "URL returned HTML webpage content instead of an image file."
 
     try:
-        img = Image.open(io.BytesIO(raw_content))
+        img = Image.open(io.BytesIO(response.body))
         img.load()
         return img, None
-    except Exception as decode_err:
-        return None, f"Failed to decode image data from {clean_url}: {str(decode_err)}"
+    except Exception:
+        return None, "Failed to decode image data."
 
 
 async def compare_logos(

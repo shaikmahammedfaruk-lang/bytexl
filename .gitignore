@@ -2,3 +2,18 @@
 .env.*
 !.env.example
 
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime files and local build output
+*.log
+logs/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/

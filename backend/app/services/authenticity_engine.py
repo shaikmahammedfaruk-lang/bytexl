@@ -3,17 +3,14 @@ import math
 import base64
 import logging
 import asyncio
-import ssl
-import urllib.request
-import urllib.error
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
-import httpx
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, distance
 from app.utils.lookalike import detect_homoglyphs, check_character_swap, check_added_words, normalize_text
 from app.utils.image_sim import compare_logos, calculate_dhash, hamming_distance, compute_sim_from_hashes
+from app.utils.safe_http import SafeFetchError, fetch_public_url
 
 logger = logging.getLogger("brandshield.authenticity_engine")
 
@@ -259,93 +256,35 @@ class BrandAuthenticityEngine:
         fetch_err = None
         resp_reason = ""
 
-        # Tier 1: Try async httpx client
+        # Fetch only public destinations and validate each redirect target.
         try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers, verify=False) as client:
-                try:
-                    resp = await client.get(raw)
-                    status_code = resp.status_code
-                    final_url = str(resp.url)
-                    html = resp.text
-                    resp_reason = resp.reason_phrase
-                    for idx, hop in enumerate(resp.history):
-                        redirect_chain.append({
-                            "step": idx + 1,
-                            "url": str(hop.url),
-                            "status": hop.status_code,
-                            "type": "Redirect / Relay"
-                        })
-                    redirect_chain.append({
-                        "step": len(resp.history) + 1,
-                        "url": final_url,
-                        "status": status_code,
-                        "type": "Final Destination (Canonical)"
-                    })
-                except (httpx.ConnectError, httpx.ConnectTimeout) as conn_err:
-                    if raw.startswith("https://"):
-                        http_raw = raw.replace("https://", "http://", 1)
-                        try:
-                            resp = await client.get(http_raw)
-                            status_code = resp.status_code
-                            final_url = str(resp.url)
-                            html = resp.text
-                            resp_reason = resp.reason_phrase
-                            redirect_chain = [{"step": 1, "url": final_url, "status": status_code, "type": "Destination"}]
-                        except Exception as e:
-                            fetch_err = str(e)
-                    else:
-                        fetch_err = str(conn_err)
-                except Exception as e:
-                    fetch_err = str(e)
-        except Exception as e:
-            fetch_err = str(e)
-
-        # Tier 2: If httpx failed, timed out, or hit WAF rate limit / challenge (429, 403, 503, or >=400), fallback to urllib
-        if status_code is None or status_code >= 400 or status_code in (429, 403, 503):
-            def _urllib_sync_fetch(target_url: str):
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                req = urllib.request.Request(
-                    target_url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.9",
-                    }
-                )
-                try:
-                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as u_resp:
-                        raw_bytes = u_resp.read()
-                        u_html = raw_bytes.decode("utf-8", errors="ignore")
-                        return u_resp.status, str(u_resp.url), u_html, "OK", None
-                except urllib.error.HTTPError as he:
-                    b = ""
-                    try:
-                        b = he.read().decode("utf-8", errors="ignore")
-                    except Exception:
-                        pass
-                    return he.code, str(he.url), b, he.reason, None
-                except Exception as ex:
-                    return None, target_url, "", "", str(ex)
-
-            try:
-                u_code, u_url, u_html, u_reason, u_exc = await asyncio.to_thread(_urllib_sync_fetch, raw)
-                if u_code is not None:
-                    # If urllib succeeded (<400) or provided content, use it!
-                    if u_code < 400 or (status_code is None or status_code >= 400):
-                        status_code = u_code
-                        final_url = u_url
-                        if u_html:
-                            html = u_html
-                        resp_reason = u_reason or ""
-                        if not redirect_chain:
-                            redirect_chain = [{"step": 1, "url": final_url, "status": status_code, "type": "Final Destination (Canonical)"}]
-                if u_exc and fetch_err is None:
-                    fetch_err = u_exc
-            except Exception as e:
-                if fetch_err is None:
-                    fetch_err = str(e)
+            response = await fetch_public_url(
+                raw,
+                timeout=timeout,
+                headers=headers,
+                max_bytes=2 * 1024 * 1024,
+            )
+            status_code = response.status_code
+            final_url = response.url
+            html = response.body.decode("utf-8", errors="replace")
+            resp_reason = response.reason
+            redirect_chain = [
+                {
+                    "step": index + 1,
+                    "url": url,
+                    "status": code,
+                    "type": "Redirect / Relay",
+                }
+                for index, (url, code) in enumerate(response.redirects)
+            ]
+            redirect_chain.append({
+                "step": len(redirect_chain) + 1,
+                "url": final_url,
+                "status": status_code,
+                "type": "Final Destination (Canonical)",
+            })
+        except SafeFetchError as exc:
+            fetch_err = str(exc)
 
         # Tier 3: Error handling and baseline resolution
         if status_code is None:

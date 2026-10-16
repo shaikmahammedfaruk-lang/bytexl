@@ -16,8 +16,9 @@ services:
     image: mongo:7.0
     container_name: brandshield-mongodb
     restart: unless-stopped
-    ports:
-      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?Set MONGO_ROOT_USERNAME in the root .env file}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in the root .env file}
     volumes:
       - mongo_data:/data/db
     networks:
@@ -42,12 +43,13 @@ services:
       mongodb:
         condition: service_healthy
     environment:
-      - MONGO_URI=mongodb://mongodb:27017
+      - MONGO_URI=mongodb://${MONGO_ROOT_USERNAME:?Set MONGO_ROOT_USERNAME in the root .env file}:${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in the root .env file}@mongodb:27017/brandshield_ai?authSource=admin
       - DB_NAME=brandshield_ai
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in the root .env file}
-      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-10080}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
       - FRONTEND_URL=${FRONTEND_URL:?Set FRONTEND_URL to the public HTTPS URL in the root .env file}
+      - CORS_ORIGINS=${CORS_ORIGINS:?Set CORS_ORIGINS to trusted frontend origins in the root .env file}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - SMTP_HOST=${SMTP_HOST:-}
       - SMTP_PORT=${SMTP_PORT:-587}

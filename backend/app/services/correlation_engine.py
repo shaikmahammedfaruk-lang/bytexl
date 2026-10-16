@@ -5,12 +5,26 @@ from bson import ObjectId
 
 logger = logging.getLogger("brandshield.correlation")
 
-async def correlate_threats_into_campaigns(db, brand_id: str) -> List[Dict[str, Any]]:
+async def correlate_threats_into_campaigns(
+    db,
+    brand_id: str,
+    owner_id: str,
+) -> List[Dict[str, Any]]:
     """
     Examines threats for a given brand and groups related multi-channel threats into coordinated Threat Campaigns.
     Generates node and edge graph data for visual graph rendering in the frontend.
     """
-    threats_cursor = db.threats.find({"brand_id": brand_id, "is_official_safe": {"$ne": True}})
+    owner_scope = {
+        "$or": [
+            {"owner_id": owner_id},
+            {"owner_id": {"$exists": False}},
+        ]
+    }
+    threats_cursor = db.threats.find({
+        "brand_id": brand_id,
+        "is_official_safe": {"$ne": True},
+        **owner_scope,
+    })
     threats = await threats_cursor.to_list(length=200)
 
     if not threats:
@@ -36,7 +50,11 @@ async def correlate_threats_into_campaigns(db, brand_id: str) -> List[Dict[str, 
 
         clusters.setdefault(cluster_key, []).append(t)
 
-    brand_doc = await db.brands.find_one({"_id": ObjectId(brand_id) if ObjectId.is_valid(brand_id) else brand_id})
+    brand_query = {
+        "_id": ObjectId(brand_id) if ObjectId.is_valid(brand_id) else brand_id,
+        "owner_id": owner_id,
+    }
+    brand_doc = await db.brands.find_one(brand_query)
     brand_name = brand_doc.get("name") if brand_doc else "Target Brand"
 
     campaigns = []
@@ -111,6 +129,7 @@ async def correlate_threats_into_campaigns(db, brand_id: str) -> List[Dict[str, 
 
             campaign_doc = {
                 "brand_id": brand_id,
+                "owner_id": owner_id,
                 "name": campaign_name,
                 "campaign_risk": campaign_risk,
                 "status": "ACTIVE",
@@ -124,15 +143,23 @@ async def correlate_threats_into_campaigns(db, brand_id: str) -> List[Dict[str, 
             }
 
             # Upsert into campaigns collection
-            existing = await db.campaigns.find_one({"brand_id": brand_id, "name": campaign_name})
+            existing = await db.campaigns.find_one({
+                "brand_id": brand_id,
+                "name": campaign_name,
+                **owner_scope,
+            })
             if existing:
                 await db.campaigns.update_one(
-                    {"_id": existing["_id"]},
+                    {
+                        "_id": existing["_id"],
+                        **owner_scope,
+                    },
                     {"$set": {
                         "campaign_risk": campaign_risk,
                         "platforms": platforms,
                         "threat_count": len(group),
                         "related_threat_ids": threat_ids,
+                        "owner_id": owner_id,
                         "nodes": nodes,
                         "edges": edges
                     }}
@@ -146,7 +173,10 @@ async def correlate_threats_into_campaigns(db, brand_id: str) -> List[Dict[str, 
 
             # Link threat documents to this campaign
             await db.threats.update_many(
-                {"_id": {"$in": [t["_id"] for t in group]}},
+                {
+                    "_id": {"$in": [t["_id"] for t in group]},
+                    **owner_scope,
+                },
                 {"$set": {"campaign_id": campaign_doc["id"], "campaign_name": campaign_name}}
             )
 
